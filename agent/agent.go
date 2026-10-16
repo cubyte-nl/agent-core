@@ -6,10 +6,10 @@
 //
 // The loop is generic over the agent's boundary type B and owns only the
 // control flow — chat, tool dispatch, the operator-confirmation step, the step
-// budget with a forced final report, the transcript, retries, and truncated-
-// response handling. Everything domain-specific (the system prompt text, the
-// live action-log rendering, the report body, the transcript's start metadata)
-// is injected through Config.
+// and time budgets with a forced final report, the transcript, retries, and
+// truncated-response handling. Everything domain-specific (the system prompt
+// text, the live action-log rendering, the report body, the transcript's start
+// metadata) is injected through Config.
 package agent
 
 import (
@@ -30,6 +30,10 @@ type Config[B tools.Boundary] struct {
 	MaxSteps  int
 	Objective string
 	ReportDir string
+	// MaxDuration bounds a run's wall-clock time; once it has passed, no new
+	// turn starts and the model is asked for its final report, as when the
+	// step budget runs out. Zero means no limit.
+	MaxDuration time.Duration
 	// Out receives the live action log; nil disables printing.
 	Out func(line string)
 	// ProgressInterval is how often a heartbeat line is emitted while a tool is
@@ -151,6 +155,9 @@ func Run[B tools.Boundary](ctx context.Context, b B, client *llm.Client, reg *to
 			"objective": cfg.Objective,
 			"max_steps": cfg.MaxSteps,
 		}
+		if cfg.MaxDuration > 0 {
+			start["max_duration"] = cfg.MaxDuration.String()
+		}
 		for k, v := range cfg.StartMeta {
 			start[k] = v
 		}
@@ -168,7 +175,8 @@ func Run[B tools.Boundary](ctx context.Context, b B, client *llm.Client, reg *to
 	steps := 0
 	truncated := 0
 	var final string
-	for steps < cfg.MaxSteps {
+	timeUp := func() bool { return cfg.MaxDuration > 0 && time.Since(now) >= cfg.MaxDuration }
+	for steps < cfg.MaxSteps && !timeUp() {
 		msg, finish, err := client.Chat(ctx, messages, specs)
 		if err != nil {
 			return nil, fmt.Errorf("step %d: %w", steps+1, err)
@@ -226,11 +234,16 @@ func Run[B tools.Boundary](ctx context.Context, b B, client *llm.Client, reg *to
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		// Step budget exhausted: force a final report from what the model has seen.
-		say("· step budget reached; asking for the final report")
+		// Step or time budget exhausted: force a final report from what the
+		// model has seen.
+		budget := "step"
+		if timeUp() {
+			budget = "time"
+		}
+		say("· " + budget + " budget reached; asking for the final report")
 		budgetMsg := llm.Message{
 			Role:    "user",
-			Content: "You have reached the step budget. Write your final report now, based on the evidence gathered so far.",
+			Content: "You have reached the " + budget + " budget. Write your final report now, based on the evidence gathered so far.",
 		}
 		messages = append(messages, budgetMsg)
 		logMsg(budgetMsg)

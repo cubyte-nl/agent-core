@@ -1,11 +1,16 @@
 package agent
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 	"unicode/utf8"
 
+	"github.com/cubyte-nl/agent-core/llm"
 	"github.com/cubyte-nl/agent-core/tools"
 )
 
@@ -78,5 +83,60 @@ func TestCapToolResultTrimsSplitRune(t *testing.T) {
 	got := capToolResult(s, 11)        // cut lands inside the euro sign
 	if !utf8.ValidString(got) {
 		t.Errorf("capped content must stay valid UTF-8, got %q", got)
+	}
+}
+
+type testBoundary struct{}
+
+func (testBoundary) Describe() string { return "test" }
+
+type sleepTool struct{}
+
+func (sleepTool) Name() string               { return "sleep" }
+func (sleepTool) Description() string        { return "sleeps briefly" }
+func (sleepTool) Parameters() map[string]any { return map[string]any{"type": "object"} }
+func (sleepTool) Mutating() bool             { return false }
+func (sleepTool) Run(context.Context, testBoundary, map[string]any) tools.Result {
+	time.Sleep(20 * time.Millisecond)
+	return tools.Result{Tool: "sleep", Allowed: true}
+}
+
+func TestRunTimeBudget(t *testing.T) {
+	// A model that keeps calling a tool, and writes a report once it is asked
+	// without tools (the forced final turn).
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Tools []any `json:"tools"`
+		}
+		json.NewDecoder(r.Body).Decode(&req)
+		msg := map[string]any{"role": "assistant", "content": "the final report"}
+		if len(req.Tools) > 0 {
+			msg = map[string]any{"role": "assistant", "content": "", "tool_calls": []any{map[string]any{
+				"id": "1", "type": "function", "function": map[string]any{"name": "sleep", "arguments": "{}"},
+			}}}
+		}
+		json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": msg, "finish_reason": "stop"}}})
+	}))
+	defer srv.Close()
+
+	var lines []string
+	res, err := Run(context.Background(), testBoundary{}, llm.NewClient(srv.URL, "", "m"),
+		tools.NewRegistry[testBoundary](false, sleepTool{}), Config[testBoundary]{
+			MaxDuration:  100 * time.Millisecond,
+			Out:          func(s string) { lines = append(lines, s) },
+			SystemPrompt: func(testBoundary, string, string) string { return "system" },
+			RenderReport: func(_ testBoundary, _, final string, _ int, _ string) string { return final },
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Report != "the final report" {
+		t.Errorf("report = %q, want the forced final report", res.Report)
+	}
+	if res.Steps == 0 || res.Steps >= 100 {
+		t.Errorf("steps = %d, want the time budget to stop the run early", res.Steps)
+	}
+	if !strings.Contains(strings.Join(lines, "\n"), "time budget reached") {
+		t.Errorf("no time-budget line in the action log: %q", lines)
 	}
 }
