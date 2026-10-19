@@ -86,6 +86,76 @@ func TestCapToolResultTrimsSplitRune(t *testing.T) {
 	}
 }
 
+func TestRunTurnStateInjectedAndReplaced(t *testing.T) {
+	// The model calls a tool twice, then writes the final report. Every chat
+	// request is captured so the injected state message can be inspected.
+	type captured struct {
+		contents []string
+	}
+	var reqs []captured
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []struct {
+				Content string `json:"content"`
+			} `json:"messages"`
+			Tools []any `json:"tools"`
+		}
+		json.NewDecoder(r.Body).Decode(&req)
+		c := captured{}
+		for _, m := range req.Messages {
+			c.contents = append(c.contents, m.Content)
+		}
+		reqs = append(reqs, c)
+		msg := map[string]any{"role": "assistant", "content": "the final report"}
+		if len(req.Tools) > 0 {
+			msg = map[string]any{"role": "assistant", "content": "", "tool_calls": []any{map[string]any{
+				"id": "1", "type": "function", "function": map[string]any{"name": "sleep", "arguments": "{}"},
+			}}}
+		}
+		json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": msg, "finish_reason": "stop"}}})
+	}))
+	defer srv.Close()
+
+	state := "STATE-v1"
+	_, err := Run(context.Background(), testBoundary{}, llm.NewClient(srv.URL, "", "m"),
+		tools.NewRegistry[testBoundary](false, sleepTool{}), Config[testBoundary]{
+			MaxSteps:     10,
+			SystemPrompt: func(testBoundary, string, string) string { return "system" },
+			RenderReport: func(_ testBoundary, _, final string, _ int, _ string) string { return final },
+			RenderTurnState: func(turn, _ int) string {
+				if turn == 0 {
+					return state
+				}
+				return "STATE-v2"
+			},
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reqs) < 3 {
+		t.Fatalf("want at least 3 chat requests (2 tool turns + final), got %d", len(reqs))
+	}
+	// Every request carries exactly one state message: injected once, then
+	// replaced in place — never a second, stale copy.
+	for i, c := range reqs {
+		var states []string
+		for _, m := range c.contents {
+			if strings.HasPrefix(m, "STATE-") {
+				states = append(states, m)
+			}
+		}
+		if len(states) != 1 {
+			t.Errorf("request %d: want exactly one state message, got %d: %v", i+1, len(states), states)
+		}
+	}
+	if !strings.HasPrefix(reqs[0].contents[2], "STATE-v1") {
+		t.Errorf("first request should carry the v1 state right after the objective, got %q", reqs[0].contents[2])
+	}
+	if !strings.HasPrefix(reqs[2].contents[2], "STATE-v2") {
+		t.Errorf("later requests should carry the replaced v2 state at the same position, got %q", reqs[2].contents[2])
+	}
+}
+
 type testBoundary struct{}
 
 func (testBoundary) Describe() string { return "test" }

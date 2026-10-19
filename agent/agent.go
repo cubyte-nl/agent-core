@@ -45,6 +45,14 @@ type Config[B tools.Boundary] struct {
 	// window. The full result is always kept in the transcript; only the model's
 	// copy is capped. Unset defaults to 8 KiB; a negative value feeds it uncapped.
 	MaxToolResult int
+	// RenderTurnState, when set, renders the compact state the model should
+	// carry through the run (working memory: findings, plan, open threads).
+	// The text is injected as a user message before every chat call, replacing
+	// the previous turn's state message in place, so the model always sees the
+	// current state without stale snapshots accumulating in the context. An
+	// empty string leaves the context unchanged; nil disables the hook.
+	// turn is the number of chat calls already made; steps the tool steps used.
+	RenderTurnState func(turn, steps int) string
 
 	// SystemPrompt builds the system prompt from the boundary, objective and
 	// model. Required.
@@ -173,10 +181,35 @@ func Run[B tools.Boundary](ctx context.Context, b B, client *llm.Client, reg *to
 	specs := reg.Specs()
 
 	steps := 0
+	turn := 0
 	truncated := 0
 	var final string
+	stateIdx := -1 // index of the injected turn-state message, or -1 if none
 	timeUp := func() bool { return cfg.MaxDuration > 0 && time.Since(now) >= cfg.MaxDuration }
+	// injectState keeps the turn-state message current right before each chat
+	// call: the first non-empty state is appended, later ones replace it in
+	// place, so the context never accumulates stale snapshots.
+	injectState := func() {
+		if cfg.RenderTurnState == nil {
+			return
+		}
+		s := cfg.RenderTurnState(turn, steps)
+		if s == "" {
+			return
+		}
+		if stateIdx < 0 {
+			messages = append(messages, llm.Message{Role: "user", Content: s})
+			stateIdx = len(messages) - 1
+		} else {
+			messages[stateIdx] = llm.Message{Role: "user", Content: s}
+		}
+		if tw != nil {
+			writeJSONL(tw, map[string]any{"event": "state", "ts": time.Now().UTC().Format(time.RFC3339), "turn": turn, "steps": steps, "content": s})
+		}
+	}
 	for steps < cfg.MaxSteps && !timeUp() {
+		injectState()
+		turn++
 		msg, finish, err := client.Chat(ctx, messages, specs)
 		if err != nil {
 			return nil, fmt.Errorf("step %d: %w", steps+1, err)
