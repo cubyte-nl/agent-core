@@ -3,7 +3,7 @@
 # agent-core is a library, so there is no image to build.
 #
 # CI/CD variables (Settings > CI/CD > Variables, protected; mask the secret):
-#   GITHUB_REPO        e.g. cubyte/agent-core
+#   GITHUB_REPO        e.g. cubyte-nl/agent-core
 #   GITHUB_DEPLOY_KEY  type File: private SSH key whose public half is a
 #                      deploy key with write access on GITHUB_REPO
 # Protect the v* tag pattern (Settings > Repository > Protected tags) so the
